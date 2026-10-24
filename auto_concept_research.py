@@ -29,6 +29,7 @@ if _env_file.exists():
 
 from llm_client import LLMClient
 from results_db import query_exhausted_families
+from research_maintenance import assert_research_enabled
 
 LOG_FILE = Path("auto_concept_research.log")
 PROGRAM_MD = Path("program.md")
@@ -195,6 +196,7 @@ def append_concepts(concepts: str, dry_run: bool = False) -> bool:
 
 
 def main():
+    assert_research_enabled()
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Don't write to program.md")
     args = parser.parse_args()

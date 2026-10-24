@@ -79,6 +79,15 @@ _scatter_ts: float = 0.0
 _SCATTER_TTL: float = 120.0
 
 
+def _require_research_period(period: str) -> str:
+    normalized = str(period).strip().casefold()
+    if normalized in {"holdout", "final_holdout", "reserved_holdout", "final_test", "blind_test"}:
+        raise ValueError("reserved final holdout evidence is unavailable to ordinary research")
+    if normalized not in {"train", "test"}:
+        raise ValueError("ordinary research results must use train or exposed-validation period")
+    return normalized
+
+
 def get_conn() -> sqlite3.Connection:
     """Open DB with WAL mode for concurrent access."""
     conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
@@ -105,6 +114,7 @@ def append_results(results: list[dict], status: str, description: str, period: s
     sharpe_ratio, total_return_pct, annual_return_pct, max_drawdown_pct,
     win_rate, profit_factor, num_trades, sortino_ratio, calmar_ratio, symbol, strategy.
     """
+    period = _require_research_period(period)
     import subprocess
     try:
         r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
@@ -172,7 +182,7 @@ def load_results() -> pd.DataFrame:
             df = pd.read_sql_query(
                 'SELECT git_commit AS "commit", strategy, symbol, sharpe, return_pct, cagr_pct, '
                 'max_dd_pct, win_rate, profit_factor, trades, sortino, calmar, '
-                'status, description, period FROM results',
+                "status, description, period FROM results WHERE period IN ('train', 'test')",
                 conn,
             )
         return df
@@ -203,7 +213,7 @@ def query_stats() -> dict:
                 SUM(period='test' AND status='keep') as test_kept,
                 MAX(CASE WHEN period='test' THEN sharpe END) as test_best,
                 MAX(CASE WHEN period='test' AND status='keep' THEN sharpe END) as best_kept_test
-            FROM results
+            FROM results WHERE period IN ('train', 'test')
         """).fetchone()
     keys = ["total","kept","discarded","crashed","best_sharpe",
             "train_total","train_kept","train_best",
@@ -216,6 +226,7 @@ def query_stats() -> dict:
 
 def query_top_rows(period: str, limit: int = 100, status: str = "keep") -> pd.DataFrame:
     """Return top active rows by Sharpe for a given period. Used by dashboard tables."""
+    period = _require_research_period(period)
     if not DB_FILE.exists():
         return pd.DataFrame()
     with get_conn() as conn:
@@ -229,6 +240,7 @@ def query_top_rows(period: str, limit: int = 100, status: str = "keep") -> pd.Da
 
 def query_avg_rows(period: str, limit: int = 50, status: str = "keep") -> pd.DataFrame:
     """Return per-strategy average metrics for active rows in a given period."""
+    period = _require_research_period(period)
     if not DB_FILE.exists():
         return pd.DataFrame()
     with get_conn() as conn:
@@ -246,6 +258,7 @@ def query_avg_rows(period: str, limit: int = 50, status: str = "keep") -> pd.Dat
 
 def query_chart_data(symbol: str = "BTCUSDT", period: str = "train") -> list:
     """Return ordered Sharpe values for progress chart."""
+    period = _require_research_period(period)
     if not DB_FILE.exists():
         return []
     with get_conn() as conn:
@@ -261,7 +274,7 @@ def query_distinct_symbols() -> list:
     if not DB_FILE.exists():
         return []
     with get_conn() as conn:
-        rows = conn.execute("SELECT DISTINCT symbol FROM results ORDER BY symbol").fetchall()
+        rows = conn.execute("SELECT DISTINCT symbol FROM results WHERE period IN ('train', 'test') ORDER BY symbol").fetchall()
     return [r[0] for r in rows]
 
 
@@ -273,7 +286,7 @@ def query_best_kept_sharpe() -> float:
         row = conn.execute("""
             SELECT MAX(avg_sharpe) FROM (
                 SELECT AVG(sharpe) as avg_sharpe FROM results
-                WHERE status='keep' GROUP BY strategy
+                WHERE period IN ('train', 'test') AND status='keep' GROUP BY strategy
             )
         """).fetchone()
     return float(row[0] or 0.0)
@@ -420,7 +433,7 @@ def query_exhausted_families(limit: int = 15, min_variants: int = 4) -> list[dic
         rows = conn.execute(
             """
             SELECT strategy, symbol, status, period, sharpe
-            FROM results
+            FROM results WHERE period IN ('train', 'test')
             """
         ).fetchall()
 
@@ -512,7 +525,7 @@ def query_recent_strategy_names(limit: int = 25) -> list[str]:
             SELECT strategy
             FROM (
                 SELECT strategy, MAX(id) AS last_id
-                FROM results
+                FROM results WHERE period IN ('train', 'test')
                 GROUP BY strategy
                 ORDER BY last_id DESC
                 LIMIT ?
@@ -533,7 +546,7 @@ def query_last_experiment_num() -> int:
             """
             SELECT description
             FROM results
-            WHERE description LIKE 'exp#%'
+            WHERE period IN ('train', 'test') AND description LIKE 'exp#%'
             ORDER BY id DESC
             LIMIT 5000
             """
@@ -629,7 +642,7 @@ def query_concept_stats() -> dict:
             SELECT strategy,
                    MAX(sharpe) as best_sharpe,
                    SUM(CASE WHEN status='keep' THEN 1 ELSE 0 END) > 0 as any_kept
-            FROM results
+            FROM results WHERE period IN ('train', 'test')
             GROUP BY strategy
         """).fetchall()
 

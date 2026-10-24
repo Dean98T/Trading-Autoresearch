@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from research_maintenance import maintenance_active
 
 
 ROOT = Path(__file__).resolve().parent
@@ -199,6 +200,9 @@ def print_status() -> int:
 
 
 def run_cycle(force: bool = False) -> int:
+    if maintenance_active():
+        log("skip: coordinated research maintenance is active")
+        return 0
     due = compute_due_status(force=force)
     if not due.due:
         log(

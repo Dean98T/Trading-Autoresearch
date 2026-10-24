@@ -19,6 +19,7 @@ from urllib.parse import quote_plus
 
 import requests
 from research_rules import MAX_ALLOWED_DRAWDOWN_PCT, TRAIN_MIN_TRADES
+from research_maintenance import assert_research_enabled
 
 ROOT = Path(__file__).resolve().parent
 DB_FILE = ROOT / "results.db"
@@ -249,7 +250,7 @@ def summarize_results_db() -> dict:
             """
             SELECT substr(strategy, 1, instr(strategy || '_', '_') - 1) AS prefix, COUNT(*) as cnt
             FROM results
-            WHERE status='keep'
+            WHERE period IN ('train', 'test') AND status='keep'
             GROUP BY prefix
             ORDER BY cnt DESC
             LIMIT 8
@@ -299,7 +300,7 @@ def build_markdown(items: list[dict], db_summary: dict) -> str:
         "",
         "## Results-Driven Direction",
         f"- Recent discard buckets: {json.dumps(db_summary.get('failure_buckets', {}), ensure_ascii=False)}",
-        f"- Active kept strategy rows: {len(db_summary.get('top_train', []))} sampled train winners, {len(db_summary.get('top_test', []))} sampled test winners",
+        f"- Active kept strategy rows: {len(db_summary.get('top_train', []))} sampled train winners, {len(db_summary.get('top_test', []))} sampled exposed-validation winners",
     ]
 
     best_timeframes = db_summary.get("best_timeframes", [])
@@ -323,7 +324,7 @@ def build_markdown(items: list[dict], db_summary: dict) -> str:
             )
 
     lines.extend(["", "## Current Winners Snapshot"])
-    for section_name, rows in (("Train", db_summary.get("top_train", [])), ("Test", db_summary.get("top_test", []))):
+    for section_name, rows in (("Train", db_summary.get("top_train", [])), ("Exposed Validation (historical test)", db_summary.get("top_test", []))):
         lines.append(f"### {section_name}")
         if not rows:
             lines.append("- None")
@@ -361,6 +362,7 @@ def write_outputs(items: list[dict], db_summary: dict, dry_run: bool = False) ->
 
 
 def main() -> int:
+    assert_research_enabled()
     parser = argparse.ArgumentParser(description="Fetch fresh public strategy ideas and summarize them for autoresearch.")
     parser.add_argument("--dry-run", action="store_true", help="Print markdown instead of writing files.")
     args = parser.parse_args()

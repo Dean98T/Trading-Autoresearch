@@ -3,6 +3,11 @@ set -euo pipefail
 
 cd /home/trading-llm-auto-research
 
+if [ -f logs/research_maintenance.flag ]; then
+  printf '[%s] maintenance active, skip scheduled self-improvement\n' "$(date '+%F %T')" >> auto_concept_research.log
+  exit 0
+fi
+
 mkdir -p logs
 LOG_FILE=auto_concept_research.log
 LOCK_FILE=logs/auto_concept_research.lock

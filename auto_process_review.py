@@ -24,6 +24,7 @@ if _env_file.exists():
 
 from llm_client import LLMClient
 from research_rules import MAX_ALLOWED_DRAWDOWN_PCT, TRAIN_MIN_TRADES
+from research_maintenance import assert_research_enabled
 
 DB_FILE = Path("results.db")
 PROGRAM_MD = Path("program.md")
@@ -217,6 +218,7 @@ def write_report(content: str, dry_run: bool = False) -> None:
 
 
 def main() -> int:
+    assert_research_enabled()
     parser = argparse.ArgumentParser(description="Generate an LLM review of the auto-research process")
     parser.add_argument("--dry-run", action="store_true", help="Print report instead of writing docs/auto_research_review.md")
     args = parser.parse_args()

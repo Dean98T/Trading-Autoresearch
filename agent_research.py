@@ -27,6 +27,8 @@ from llm_client import LLMClient, LLMTimeoutError
 from evaluate import compute_metrics
 from backtest import run_strategy_backtest
 from prepare import load_config
+from research_lifecycle import ResearchLifecycle
+from research_maintenance import assert_research_enabled, lifecycle_writer, maintenance_active
 from research_rules import (
     MAX_ALLOWED_DRAWDOWN_PCT,
     TEST_MIN_SHARPE,
@@ -632,6 +634,7 @@ def evaluate_strategy_quality(
     train_results: list[dict],
     test_results: list[dict],
     test_pass_by_symbol: dict[str, bool],
+    lifecycle: ResearchLifecycle | None = None,
 ) -> tuple[bool, float, str, dict]:
     """Decide whether a kept strategy is materially useful, not just another SOL-only clone."""
     kept_test_rows = []
@@ -644,7 +647,11 @@ def evaluate_strategy_quality(
     focus_score = compute_focus_score(kept_test_rows)
     kept_symbols = {row["symbol"] for row in kept_test_rows}
     btc_eth_kept = kept_symbols & BTC_ETH_SYMBOLS
-    family_stats = query_strategy_family_stats(strategy_name=strategy_name)
+    family_stats = (
+        _lifecycle_strategy_family_stats(strategy_name, lifecycle)
+        if lifecycle is not None
+        else query_strategy_family_stats(strategy_name=strategy_name)
+    )
     family_variants = int(family_stats.get("distinct_strategies", 0) or 0)
     family_best_btc_eth = float(family_stats.get("best_btc_eth_sharpe", 0) or 0)
     family_best_focus = float(family_stats.get("best_focus_score", 0) or 0)
@@ -678,6 +685,39 @@ def evaluate_strategy_quality(
         return False, focus_score, f"duplicate metrics clone of saved strategy '{existing_name}'", family_stats
 
     return True, focus_score, "", family_stats
+
+
+def _lifecycle_strategy_family_stats(strategy_name: str, lifecycle: ResearchLifecycle) -> dict:
+    family_key = strategy_family_key(strategy_name)
+    grouped: dict[str, list[dict]] = {}
+    for row in _lifecycle_test_rows(lifecycle):
+        name = row["strategy"]
+        if name == strategy_name or strategy_family_key(name) != family_key:
+            continue
+        metrics = row["metrics"]
+        grouped.setdefault(name, []).append({"symbol": row["symbol"], "sharpe": metrics.get("sharpe_ratio", 0)})
+    best_btc_eth = 0.0
+    best_sol = 0.0
+    btc_eth_variants = 0
+    best_focus = 0.0
+    for rows in grouped.values():
+        symbols = {row["symbol"] for row in rows if float(row.get("sharpe", 0) or 0) > 0}
+        if symbols & {"BTCUSDT", "ETHUSDT"}:
+            btc_eth_variants += 1
+        for row in rows:
+            if row["symbol"] in {"BTCUSDT", "ETHUSDT"}:
+                best_btc_eth = max(best_btc_eth, float(row.get("sharpe", 0) or 0))
+            elif row["symbol"] == "SOLUSDT":
+                best_sol = max(best_sol, float(row.get("sharpe", 0) or 0))
+        best_focus = max(best_focus, compute_focus_score(rows))
+    return {
+        "family": family_key,
+        "distinct_strategies": len(grouped),
+        "btc_eth_variants": btc_eth_variants,
+        "best_btc_eth_sharpe": best_btc_eth,
+        "best_sol_sharpe": best_sol,
+        "best_focus_score": best_focus,
+    }
 
 
 def load_recent_history_from_db(n: int = 20) -> list[dict]:
@@ -744,11 +784,172 @@ def load_recent_history_from_db(n: int = 20) -> list[dict]:
         return []
 
 
+def load_recent_history_from_lifecycle(lifecycle: ResearchLifecycle, n: int = 20) -> list[dict]:
+    """Resume prompt feedback from current lifecycle evidence, excluding reserved roles."""
+    lifecycle.require_fresh_view()
+    attempts = lifecycle.list_attempts()
+    rows = lifecycle.current_results()
+    by_attempt: dict[str, list[dict]] = {}
+    for row in rows:
+        by_attempt.setdefault(row["attempt_id"], []).append(row)
+    history: list[dict] = []
+
+    for attempt in attempts:
+        attempt_rows = by_attempt.get(attempt["attempt_id"], [])
+        train_rows = [row for row in attempt_rows if row["period"] == "train"]
+        test_rows = [row for row in attempt_rows if row["period"] == "test"]
+        measured = [row for row in train_rows if row["metrics"] is not None]
+        metrics = [row["metrics"] for row in measured]
+        avg_sharpe = sum(float(item.get("sharpe_ratio", 0) or 0) for item in metrics) / len(metrics) if metrics else 0.0
+        avg_trades = sum(float(item.get("num_trades", 0) or 0) for item in metrics) / len(metrics) if metrics else 0.0
+        kept = any(row["selection_eligibility"] == "eligible" for row in test_rows)
+        terminal_events = [
+            event for event in attempt["events"]
+            if event["event_type"] in {"generation_failed", "validation_failed", "generation_interrupted"}
+        ]
+        event_reason = terminal_events[-1]["payload"].get("reason", "") if terminal_events else ""
+        reasons = [row["reason"] for row in train_rows if row.get("reason")]
+        fail_reason = "; ".join(reasons) or event_reason
+        if not kept and test_rows and not fail_reason:
+            fail_reason = "exposed_validation_failure"
+        elif not kept and not test_rows and any(row["selection_eligibility"] == "eligible" for row in train_rows):
+            fail_reason = "exposed_validation_not_observed"
+        if not fail_reason and not kept:
+            timeframe = _timeframe_from_source(lifecycle, attempt["attempt_id"])
+            threshold = {"4h": 400, "6h": 300, "12h": 200, "1d": 150, "1h": 600}.get(timeframe, 500)
+            if avg_trades > threshold:
+                fail_reason = "overtrading"
+            elif measured and avg_trades < TRAIN_MIN_TRADES:
+                fail_reason = "too_few_trades"
+            elif measured and avg_sharpe < 0:
+                fail_reason = "negative_sharpe"
+        experiment_num = attempt["metadata"].get("experiment_number")
+        history.append({
+            "num": int(experiment_num) if isinstance(experiment_num, (int, float)) else len(history) + 1,
+            "name": attempt["display_strategy_name"],
+            "status": "keep" if kept else ("crash" if terminal_events else "discard"),
+            "avg_sharpe": avg_sharpe,
+            "avg_return": 0.0,
+            "avg_trades": avg_trades,
+            "fail_reason": fail_reason,
+            "tf": _timeframe_from_source(lifecycle, attempt["attempt_id"]),
+            "description": "durable lifecycle evidence",
+            "attempt_id": attempt["attempt_id"],
+            "exposed_validation_rows": test_rows,
+        })
+
+    attempt_history = history
+    history = []
+    # Legacy rows remain useful as exposed validation, with their provenance uncertainty visible.
+    legacy: dict[str, list[dict]] = {}
+    for row in lifecycle.legacy_results():
+        if row["evidence_role"] == "reserved_holdout":
+            continue
+        legacy.setdefault(row["strategy"], []).append(row)
+    for name, strategy_rows in legacy.items():
+        train_rows = [row for row in strategy_rows if row["period"] == "train"]
+        sharpe_values = [float(row["sharpe"]) for row in train_rows if row["sharpe"]]
+        trade_values = [float(row["trades"]) for row in train_rows if row["trades"]]
+        kept = any(row["status"] == "keep" for row in train_rows)
+        history.append({
+            "num": len(history) + 1,
+            "name": name,
+            "status": "keep" if kept else "discard",
+            "avg_sharpe": sum(sharpe_values) / len(sharpe_values) if sharpe_values else 0.0,
+            "avg_return": 0.0,
+            "avg_trades": sum(trade_values) / len(trade_values) if trade_values else 0.0,
+            "fail_reason": "legacy evidence; attempt and source provenance unknown",
+            "tf": "",
+            "description": "legacy baseline; provenance unknown",
+            "attempt_id": None,
+            "exposed_validation_rows": [row for row in strategy_rows if row["period"] == "test"],
+        })
+    if not n:
+        return []
+    remaining = max(0, n - len(attempt_history))
+    return history[-remaining:] + attempt_history[-n:] if remaining else attempt_history[-n:]
+
+
+def _timeframe_from_source(lifecycle: ResearchLifecycle, attempt_id: str) -> str:
+    try:
+        code = lifecycle.read_artifact(attempt_id, "candidate_source").decode("utf-8")
+    except (KeyError, OSError, UnicodeDecodeError):
+        return ""
+    match = re.search(r'timeframe\s*=\s*["\'](\w+)["\']', code)
+    return match.group(1) if match else ""
+
+
+def _lifecycle_test_rows(lifecycle: ResearchLifecycle) -> list[dict]:
+    lifecycle.require_fresh_view()
+    attempts = {item["attempt_id"]: item for item in lifecycle.list_attempts()}
+    return [
+        {**row, "strategy": attempts[row["attempt_id"]]["display_strategy_name"]}
+        for row in lifecycle.current_results(selection_eligible_only=True)
+        if row["period"] == "test" and row["metrics"] is not None
+    ]
+
+
+def _lifecycle_best_focus_score(lifecycle: ResearchLifecycle) -> float:
+    """Resume the quality threshold from current eligible exposed-validation evidence."""
+    grouped: dict[str, list[dict]] = {}
+    for row in _lifecycle_test_rows(lifecycle):
+        grouped.setdefault(row["attempt_id"], []).append({
+            "symbol": row["symbol"],
+            "sharpe": row["metrics"].get("sharpe_ratio", 0),
+        })
+    return max((compute_focus_score(rows) for rows in grouped.values()), default=0.0)
+
+
+def _build_lifecycle_db_summary(lifecycle: ResearchLifecycle) -> str:
+    rows = [
+        row for row in _lifecycle_test_rows(lifecycle)
+        if float(row["metrics"].get("num_trades", 0) or 0) >= 20
+        and float(row["metrics"].get("sharpe_ratio", 0) or 0) > 0.8
+    ]
+    rows.sort(key=lambda row: float(row["metrics"].get("sharpe_ratio", 0) or 0), reverse=True)
+    if not rows:
+        return ""
+    lines = ["\n\nCURRENT LIFECYCLE TOP PERFORMERS (historical exposed validation, not final holdout):"]
+    for row in rows[:6]:
+        metrics = row["metrics"]
+        lines.append(
+            f"  {row['strategy'][:50]} | {row['symbol']} | "
+            f"exposed_validation_sharpe={float(metrics.get('sharpe_ratio', 0) or 0):.3f} | "
+            f"{int(metrics.get('num_trades', 0) or 0)}tr"
+        )
+    return "\n".join(lines)
+
+
+def _build_lifecycle_family_summary(lifecycle: ResearchLifecycle) -> str:
+    families: dict[str, dict] = {}
+    for row in _lifecycle_test_rows(lifecycle):
+        family = strategy_family_key(row["strategy"])
+        stats = families.setdefault(family, {"names": set(), "best_btc_eth": 0.0, "best_sol": 0.0})
+        stats["names"].add(row["strategy"])
+        sharpe = float(row["metrics"].get("sharpe_ratio", 0) or 0)
+        if row["symbol"] in {"BTCUSDT", "ETHUSDT"}:
+            stats["best_btc_eth"] = max(stats["best_btc_eth"], sharpe)
+        elif row["symbol"] == "SOLUSDT":
+            stats["best_sol"] = max(stats["best_sol"], sharpe)
+    saturated = [(family, stats) for family, stats in families.items() if len(stats["names"]) >= 4]
+    if not saturated:
+        return ""
+    lines = ["\nSATURATED FAMILIES FROM CURRENT LIFECYCLE EVIDENCE:"]
+    for family, stats in sorted(saturated, key=lambda item: len(item[1]["names"]), reverse=True)[:8]:
+        lines.append(
+            f"  {family} | {len(stats['names'])} variants | "
+            f"best BTC/ETH exposed validation={stats['best_btc_eth']:.2f} | "
+            f"best SOL exposed validation={stats['best_sol']:.2f}"
+        )
+    return "\n".join(lines)
+
+
 def build_experiment_prompt(
     program: str,
     current_strategy: str,
     history: list[dict],
     experiment_num: int,
+    lifecycle: ResearchLifecycle | None = None,
 ) -> str:
     # Summarize history with failure reasons + trade counts
     history_str = ""
@@ -768,15 +969,32 @@ def build_experiment_prompt(
                 else:
                     trades_note = f" ({avg_trades:.0f} tr/sym)"
             reason_note = f" ← {fail_reason}" if fail_reason else ""
+            validation_rows = h.get("exposed_validation_rows", [])
+            validation_values = []
+            for row in validation_rows:
+                metrics = row.get("metrics") or row
+                value = metrics.get("sharpe_ratio", metrics.get("sharpe"))
+                if value not in (None, ""):
+                    validation_values.append(float(value))
+            validation_note = (
+                f" | exposed validation Sharpe={sum(validation_values) / len(validation_values):.3f}"
+                if validation_values else ""
+            )
             history_str += (
                 f"  #{h['num']:03d} [{h['status']:>7s}] {h['name']} | "
-                f"Sharpe={h['avg_sharpe']:.3f}{trades_note}{reason_note}\n"
+                f"Train Sharpe={h['avg_sharpe']:.3f}{validation_note}{trades_note}{reason_note}\n"
             )
 
     best = max(history, key=lambda x: x["avg_sharpe"]) if history else None
     best_str = ""
     if best and best["avg_sharpe"] > 0:
         best_str = f"\nSESSION BEST SO FAR: {best['name']} | avg_sharpe={best['avg_sharpe']:.3f}"
+    lifecycle_evidence_note = ""
+    if lifecycle is not None:
+        lifecycle_evidence_note = (
+            "\nEvidence terms: historical test metrics are exposed validation, not final holdout. "
+            "Final holdout is reserved and cannot guide ordinary research."
+        )
 
     # Determine which phase and what to try next
     phase_hint = ""
@@ -901,11 +1119,12 @@ REMEMBER: call get_htf_data() ONCE before loop, use aligned arrays inside."""
                 avoid_str += f"  {p}\n"
 
     # Add DB-level "what works" summary for context (load top performers)
-    db_summary = _build_db_summary(primary_tf)
-    family_avoidance = _build_family_avoidance_summary()
+    db_summary = _build_lifecycle_db_summary(lifecycle) if lifecycle is not None else _build_db_summary(primary_tf)
+    family_avoidance = _build_lifecycle_family_summary(lifecycle) if lifecycle is not None else _build_family_avoidance_summary()
 
     return f"""EXPERIMENT #{experiment_num:03d}
 {phase_hint}
+{lifecycle_evidence_note}
 
 RULES:
 - Train: 2021-2024 | Primary TF: 4h/6h/12h/1d preferred | HTF ref: up to 1w
@@ -971,15 +1190,354 @@ def validate_strategy(code: str) -> tuple[bool, str]:
     return False, summarize_validation_errors(result)
 
 
+class ResearchEvidenceWriteError(RuntimeError):
+    """Required research evidence could not be durably recorded."""
+
+
+def _safe_failure_message(error: Exception) -> str:
+    message = str(error)
+    message = re.sub(
+        r"(?i)(api[_ -]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        message,
+    )
+    message = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", message)
+    return message[:1000]
+
+
+@lifecycle_writer("autonomous-generation")
+def request_candidate_with_lifecycle(
+    *,
+    lifecycle: ResearchLifecycle,
+    client: LLMClient,
+    system_prompt: str,
+    user_prompt: str,
+    config: dict,
+    experiment_num: int,
+    source_snapshot: dict[str, str | bytes] | None = None,
+    parent_attempt_id: str | None = None,
+) -> dict:
+    """Make one caller-visible generation request through the durable ledger.
+
+    Prompts and configuration are archived before the provider call. The raw
+    response and extracted candidate are archived before the caller may
+    validate or copy the candidate to the mutable working strategy file.
+    """
+    if parent_attempt_id is None:
+        parent_attempt_id = lifecycle.mark_latest_unfinished_generation()
+    requested_model = "provider_default"
+    try:
+        requested_model = client._get_model() or "provider_default"
+    except Exception:
+        pass
+    try:
+        attempt = lifecycle.begin_attempt(
+            strategy_name=f"autonomous_{experiment_num:03d}",
+            origin="autonomous",
+            configuration=config,
+            source_snapshot=source_snapshot,
+            input_artifacts={
+                "caller_prompt/system": system_prompt,
+                "caller_prompt/user": user_prompt,
+            },
+            metadata={
+                "experiment_number": experiment_num,
+                "requested_provider": getattr(client, "provider", "unknown"),
+                "requested_model": requested_model,
+                "actual_model": "unknown",
+                "provider_internal_retries": "unknown",
+            },
+            parent_attempt_id=parent_attempt_id,
+            requested_period="train+test",
+        )
+        lifecycle.record_event(
+            attempt["attempt_id"],
+            event_type="generation_requested",
+            stage="generation",
+            payload={
+                "requested_provider": getattr(client, "provider", "unknown"),
+                "requested_model": requested_model,
+                "actual_model": "unknown",
+                "provider_internal_retries": "unknown",
+                "technical_outcome": "in_progress",
+                "performance_qualification": "not_measured",
+            },
+        )
+    except Exception as exc:
+        raise ResearchEvidenceWriteError("could not record autonomous request before provider call") from exc
+
+    try:
+        raw_response = client.chat(user_prompt, system=system_prompt, temperature=0.8)
+    except Exception as exc:
+        if isinstance(exc, LLMTimeoutError):
+            outcome = "timeout"
+        elif type(exc).__name__ == "LLMAuthenticationError":
+            outcome = "authentication_error"
+        elif type(exc).__name__ == "LLMUsageLimitError":
+            outcome = "usage_limit"
+        else:
+            outcome = "generation_error"
+        try:
+            lifecycle.record_event(
+                attempt["attempt_id"],
+                event_type="generation_failed",
+                stage="generation",
+                payload={
+                    "technical_outcome": outcome,
+                    "performance_qualification": "not_measured",
+                    "selection_eligibility": "ineligible",
+                    "error_type": type(exc).__name__,
+                    "reason": _safe_failure_message(exc),
+                },
+            )
+        except Exception as write_error:
+            raise ResearchEvidenceWriteError("could not record autonomous generation failure") from write_error
+        return {"attempt": attempt, "raw_response": None, "code": None, "error": exc}
+
+    if not isinstance(raw_response, str):
+        raw_response = str(raw_response)
+    try:
+        lifecycle.record_artifact(attempt["attempt_id"], "caller_response", raw_response)
+        code = extract_code(raw_response)
+        lifecycle.record_artifact(attempt["attempt_id"], "candidate_source", code)
+        lifecycle.record_event(
+            attempt["attempt_id"],
+            event_type="candidate_named",
+            stage="generation",
+            payload={
+                "strategy_name": extract_strategy_name(
+                    code,
+                    fallback=f"strategy_{experiment_num:03d}",
+                )
+            },
+        )
+        lifecycle.record_event(
+            attempt["attempt_id"],
+            event_type="generation_completed",
+            stage="generation",
+            payload={
+                "technical_outcome": "completed",
+                "performance_qualification": "not_measured",
+                "response_bytes": len(raw_response.encode("utf-8")),
+                "candidate_bytes": len(code.encode("utf-8")),
+            },
+        )
+    except Exception as exc:
+        raise ResearchEvidenceWriteError("could not archive autonomous provider response") from exc
+
+    valid, reason = validate_strategy(code)
+    try:
+        lifecycle.record_event(
+            attempt["attempt_id"],
+            event_type="validation_passed" if valid else "validation_failed",
+            stage="validation",
+            payload={
+                "technical_outcome": "completed" if valid else "rejected",
+                "performance_qualification": "not_measured",
+                "selection_eligibility": "eligible_for_evaluation" if valid else "ineligible",
+                "reason": reason,
+            },
+        )
+    except Exception as exc:
+        raise ResearchEvidenceWriteError("could not record autonomous validation outcome") from exc
+    attempt = lifecycle.get_attempt(attempt["attempt_id"])
+    return {
+        "attempt": attempt,
+        "raw_response": raw_response,
+        "code": code,
+        "error": None,
+        "valid": valid,
+        "reason": reason,
+    }
+
+
+@lifecycle_writer("autonomous-evaluation")
+def evaluate_attempt_with_lifecycle(
+    *,
+    lifecycle: ResearchLifecycle,
+    attempt_id: str,
+    strategy_path: str,
+    symbols: list[str],
+    config: dict,
+    evaluator=None,
+) -> dict:
+    """Run the autonomous train-then-validation flow and record each outcome."""
+    source = lifecycle.read_artifact(attempt_id, "candidate_source")
+    if Path(strategy_path).read_bytes() != source:
+        raise ValueError("working strategy source does not match the attempt's archived candidate")
+    if not symbols:
+        raise ValueError("at least one symbol is required")
+
+    data_config = config.get("data", {}) if isinstance(config, dict) else {}
+    train_evaluation = lifecycle.begin_evaluation(
+        attempt_id,
+        period="train",
+        symbols=symbols,
+        context={
+            "requested_window": {
+                "start": data_config.get("train_start", "unknown"),
+                "end": data_config.get("train_end", "unknown"),
+            },
+            "actual_coverage": "unknown",
+            "input_identity": "unknown",
+            "data_role": "development",
+        },
+    )
+    test_evaluation = lifecycle.begin_evaluation(
+        attempt_id,
+        period="test",
+        symbols=symbols,
+        context={
+            "requested_window": {
+                "start": data_config.get("test_start", "unknown"),
+                "end": data_config.get("test_end", "unknown"),
+            },
+            "actual_coverage": "unknown",
+            "input_identity": "unknown",
+            "data_role": "exposed_validation",
+        },
+    )
+    run_one = evaluator or (
+        lambda path, symbol, period: run_backtest_all(
+            [symbol], path, period=period, early_discard=False
+        )[0]
+    )
+    train_results: list[dict] = []
+    test_results: list[dict] = []
+    train_outcomes: list[dict] = []
+    test_outcomes: list[dict] = []
+    test_pass_by_symbol: dict[str, bool] = {}
+
+    for symbol in symbols:
+        try:
+            metrics = dict(run_one(strategy_path, symbol, "train"))
+            metrics["strategy"] = lifecycle.get_attempt(attempt_id)["display_strategy_name"]
+            metrics["symbol"] = symbol
+            train_results.append(metrics)
+            train_pass = train_symbol_pass(metrics)
+            train_outcomes.append(
+                lifecycle.record_outcome(
+                    train_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="train",
+                    technical_outcome="completed",
+                    performance_qualification="qualified" if train_pass else "unqualified",
+                    selection_eligibility="pending" if train_pass else "ineligible",
+                    metrics=metrics,
+                )
+            )
+        except Exception as exc:
+            outcome = "timeout" if isinstance(exc, TimeoutError) else "error"
+            train_outcomes.append(
+                lifecycle.record_outcome(
+                    train_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="train",
+                    technical_outcome=outcome,
+                    performance_qualification="not_measured",
+                    selection_eligibility="ineligible",
+                    reason=f"{type(exc).__name__}: {_safe_failure_message(exc)}",
+                )
+            )
+            test_outcomes.append(
+                lifecycle.record_outcome(
+                    test_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="test",
+                    technical_outcome="skipped",
+                    performance_qualification="not_measured",
+                    selection_eligibility="ineligible",
+                    reason="test skipped because train evaluation did not complete",
+                )
+            )
+            test_pass_by_symbol[symbol] = False
+            continue
+
+        if not train_pass:
+            test_outcomes.append(
+                lifecycle.record_outcome(
+                    test_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="test",
+                    technical_outcome="skipped",
+                    performance_qualification="not_measured",
+                    selection_eligibility="ineligible",
+                    reason="test skipped because train performance did not qualify",
+                )
+            )
+            test_pass_by_symbol[symbol] = False
+            continue
+
+        try:
+            metrics = dict(run_one(strategy_path, symbol, "test"))
+            metrics["strategy"] = lifecycle.get_attempt(attempt_id)["display_strategy_name"]
+            metrics["symbol"] = symbol
+            test_results.append(metrics)
+            test_pass = test_symbol_pass(metrics)
+            test_pass_by_symbol[symbol] = test_pass
+            test_outcomes.append(
+                lifecycle.record_outcome(
+                    test_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="test",
+                    technical_outcome="completed",
+                    performance_qualification="qualified" if test_pass else "unqualified",
+                    selection_eligibility="eligible" if test_pass else "ineligible",
+                    metrics=metrics,
+                )
+            )
+        except Exception as exc:
+            outcome = "timeout" if isinstance(exc, TimeoutError) else "error"
+            test_pass_by_symbol[symbol] = False
+            test_outcomes.append(
+                lifecycle.record_outcome(
+                    test_evaluation["evaluation_id"],
+                    symbol=symbol,
+                    period="test",
+                    technical_outcome=outcome,
+                    performance_qualification="not_measured",
+                    selection_eligibility="ineligible",
+                    reason=f"{type(exc).__name__}: {_safe_failure_message(exc)}",
+                )
+            )
+
+    lifecycle.publish_current_results(train_evaluation["evaluation_id"])
+    lifecycle.publish_current_results(test_evaluation["evaluation_id"])
+    return {
+        "train_evaluation": train_evaluation,
+        "test_evaluation": test_evaluation,
+        "train_results": train_results,
+        "test_results": test_results,
+        "train_outcomes": train_outcomes,
+        "test_outcomes": test_outcomes,
+        "test_pass_by_symbol": test_pass_by_symbol,
+        "any_kept": any(test_pass_by_symbol.values()),
+    }
+
+
 def main():
+    assert_research_enabled()
     parser = argparse.ArgumentParser(description="LLM Autonomous Research Loop")
     parser.add_argument("--max", type=int, default=999999, help="Max experiments (default: unlimited)")
     parser.add_argument("--provider", default=None, help="LLM provider (ollama/openai/anthropic/gemini)")
     parser.add_argument("--symbols", nargs="+", default=None)
+    parser.add_argument("--lifecycle-ledger", type=Path, default=None, help="Opt in to durable research attempt recording")
+    parser.add_argument("--lifecycle-artifacts", type=Path, default=None, help="Artifact archive required with --lifecycle-ledger")
     args = parser.parse_args()
+
+    if bool(args.lifecycle_ledger) != bool(args.lifecycle_artifacts):
+        parser.error("--lifecycle-ledger and --lifecycle-artifacts must be provided together")
 
     config = load_config()
     symbols = args.symbols or config["data"]["symbols"]
+    lifecycle = (
+        ResearchLifecycle(args.lifecycle_ledger, args.lifecycle_artifacts)
+        if args.lifecycle_ledger
+        else None
+    )
+    if lifecycle:
+        lifecycle.rebuild_current_results()
+    parent_attempt_id = lifecycle.mark_latest_unfinished_generation() if lifecycle else None
 
     # Init LLM client
     print(f"[{datetime.now():%H:%M:%S}] Initializing LLM client...")
@@ -1000,7 +1558,11 @@ def main():
     # Initialize best BTC/ETH-weighted test score from existing results.
     best_score = 0.0
     try:
-        prev_best = query_best_focus_score()
+        prev_best = (
+            _lifecycle_best_focus_score(lifecycle)
+            if lifecycle is not None
+            else query_best_focus_score()
+        )
         if prev_best > best_score:
             best_score = prev_best
             print(f"  Resuming from previous best focus score: {best_score:.3f}")
@@ -1008,7 +1570,11 @@ def main():
         pass
 
     # Load recent history from DB so LLM has context even after restart
-    history = load_recent_history_from_db(n=20)
+    history = (
+        load_recent_history_from_lifecycle(lifecycle, n=20)
+        if lifecycle is not None
+        else load_recent_history_from_db(n=20)
+    )
     if history:
         print(f"  Loaded {len(history)} recent experiments from DB for LLM context")
         recent_discards = sum(1 for h in history if h["status"] == "discard")
@@ -1027,6 +1593,9 @@ def main():
     print()
 
     for experiment_num in range(start_experiment_num, start_experiment_num + args.max):
+        if maintenance_active():
+            print("Research loop paused for coordinated maintenance.", flush=True)
+            break
         save_research_state(
             status="running",
             current_experiment_num=experiment_num,
@@ -1065,11 +1634,43 @@ def main():
             current_strategy=current_strategy,
             history=history,
             experiment_num=experiment_num,
+            lifecycle=lifecycle,
         )
 
+        generation = None
         try:
-            response = client.chat(prompt, system=system_prompt, temperature=0.8)
-            new_code = extract_code(response)
+            if lifecycle:
+                snapshot = {"strategy.py": current_strategy, "program.md": program}
+                rules_path = Path("STRATEGY_RULES.md")
+                if rules_path.is_file():
+                    snapshot["STRATEGY_RULES.md"] = rules_path.read_bytes()
+                generation = request_candidate_with_lifecycle(
+                    lifecycle=lifecycle,
+                    client=client,
+                    system_prompt=system_prompt,
+                    user_prompt=prompt,
+                    config=config,
+                    experiment_num=experiment_num,
+                    source_snapshot=snapshot,
+                    parent_attempt_id=parent_attempt_id,
+                )
+                parent_attempt_id = generation["attempt"]["attempt_id"]
+                if generation["error"] is not None:
+                    raise generation["error"]
+                response = generation["raw_response"]
+                new_code = generation["code"]
+            else:
+                response = client.chat(prompt, system=system_prompt, temperature=0.8)
+                new_code = extract_code(response)
+        except ResearchEvidenceWriteError as e:
+            print(f"  [PAUSE] Required research evidence could not be recorded: {e}")
+            save_research_state(
+                status="paused_evidence_failure",
+                current_experiment_num=experiment_num,
+                next_experiment_num=experiment_num,
+                last_completed_experiment_num=max(experiment_num - 1, 0),
+            )
+            break
         except LLMTimeoutError as e:
             print(f"  [TIMEOUT] LLM call timed out ({e}). Retrying in 10s...")
             save_research_state(
@@ -1100,7 +1701,11 @@ def main():
             continue
 
         # --- Step 2: Validate ---
-        valid, reason = validate_strategy(new_code)
+        valid, reason = (
+            (generation["valid"], generation["reason"])
+            if generation is not None
+            else validate_strategy(new_code)
+        )
         if not valid:
             print(f"  [SKIP] Invalid strategy: {reason}")
             history.append({
@@ -1137,7 +1742,20 @@ def main():
         all_test_results = []
         test_pass_by_symbol: dict[str, bool] = {}
 
-        for symbol in symbols:
+        if lifecycle:
+            lifecycle_evaluation = evaluate_attempt_with_lifecycle(
+                lifecycle=lifecycle,
+                attempt_id=generation["attempt"]["attempt_id"],
+                strategy_path=str(STRATEGY_FILE),
+                symbols=symbols,
+                config=config,
+            )
+            all_train_results = lifecycle_evaluation["train_results"]
+            all_test_results = lifecycle_evaluation["test_results"]
+            test_pass_by_symbol = lifecycle_evaluation["test_pass_by_symbol"]
+            any_kept = lifecycle_evaluation["any_kept"]
+
+        for symbol in ([] if lifecycle else symbols):
             # --- Train ---
             try:
                 train_result = run_backtest_all([symbol], str(STRATEGY_FILE), period="train", early_discard=False)
@@ -1224,6 +1842,7 @@ def main():
                 train_results=all_train_results,
                 test_results=all_test_results,
                 test_pass_by_symbol=test_pass_by_symbol,
+                lifecycle=lifecycle,
             )
             if quality_ok:
                 best_score = max(best_score, strategy_score)

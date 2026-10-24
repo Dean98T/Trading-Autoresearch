@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 STRATEGIES_DIR = ROOT / "strategies"
 RESULTS_FILE = ROOT / "results.tsv"
+PREFER_RESULTS_FILE = False
+_LIFECYCLE_TEMP_DIR = None
 KLINES_DIR = ROOT / "data" / "processed" / "klines"
 FUNDING_DIR = ROOT / "data" / "processed" / "funding"
 DEFAULT_OUTPUT_DIR = ROOT / "independent-verification" / "output"
@@ -136,6 +139,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tail-check", type=int, default=3, help="Tail window size for prefix stability checks.")
     parser.add_argument("--max-prefix-checks", type=int, default=4, help="Maximum prefix checkpoints per strategy.")
     parser.add_argument("--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)), help="Parallel workers across strategies.")
+    parser.add_argument("--results-file", type=Path, default=None, help="Use this explicit TSV as the verification claim snapshot.")
+    parser.add_argument("--lifecycle-ledger", type=Path, default=None, help="Resolve attempt-qualified source from a lifecycle ledger.")
+    parser.add_argument("--lifecycle-artifacts", type=Path, default=None, help="Artifact archive paired with --lifecycle-ledger.")
     return parser.parse_args()
 
 
@@ -144,7 +150,7 @@ def load_claims() -> pd.DataFrame:
     if CLAIMS_DF is None:
         db_path = ROOT / "results.db"
         current = {path.stem for path in STRATEGIES_DIR.glob("*.py")}
-        if db_path.exists():
+        if db_path.exists() and not PREFER_RESULTS_FILE:
             with sqlite3.connect(db_path) as conn:
                 claims = pd.read_sql_query(
                     """
@@ -165,12 +171,13 @@ def load_claims() -> pd.DataFrame:
                         description,
                         period
                     FROM results
+                    WHERE period IN ('train', 'test')
                     """,
                     conn,
                 )
         else:
             claims = pd.read_csv(RESULTS_FILE, sep="\t")
-        claims = claims[claims["strategy"].isin(current)].copy()
+        claims = claims[claims["period"].isin(["train", "test"]) & claims["strategy"].isin(current)].copy()
         CLAIMS_DF = claims
     return CLAIMS_DF.copy()
 
@@ -181,6 +188,26 @@ def strategy_files(filter_names: list[str] | None) -> list[Path]:
         return paths
     allowed = {name.removesuffix(".py") for name in filter_names}
     return [path for path in paths if path.stem in allowed]
+
+
+def materialize_lifecycle_strategies(lifecycle, destination: Path, existing_strategy_dir: Path | None = None) -> Path:
+    """Expose attempt-qualified archived sources to the verifier without editing saved strategies."""
+    destination.mkdir(parents=True, exist_ok=True)
+    source_dir = existing_strategy_dir or (ROOT / "strategies")
+    for legacy_path in source_dir.glob("*.py"):
+        target = destination / legacy_path.name
+        if not target.exists():
+            target.write_bytes(legacy_path.read_bytes())
+    for attempt_id in {row["attempt_id"] for row in lifecycle.current_results()}:
+        attempt = lifecycle.get_attempt(attempt_id)
+        if attempt is None or not attempt.get("source_hash"):
+            continue
+        try:
+            source = lifecycle.read_artifact(attempt_id, "candidate_source")
+        except (KeyError, OSError):
+            continue
+        (destination / f"{attempt['attempt_key']}.py").write_bytes(source)
+    return destination
 
 
 def import_strategy(path: Path) -> StrategyContext:
@@ -1408,10 +1435,28 @@ def render_dashboard(results: pd.DataFrame, strategy_summary: pd.DataFrame, data
 
 
 def run(args: argparse.Namespace) -> None:
-    global START_DATE
+    global START_DATE, RESULTS_FILE, PREFER_RESULTS_FILE, STRATEGIES_DIR, _LIFECYCLE_TEMP_DIR
     START_DATE = pd.Timestamp(args.start_date, tz="UTC")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.results_file is not None:
+        RESULTS_FILE = args.results_file.resolve()
+        PREFER_RESULTS_FILE = True
+    if bool(args.lifecycle_ledger) != bool(args.lifecycle_artifacts):
+        raise ValueError("--lifecycle-ledger and --lifecycle-artifacts must be provided together")
+    if args.lifecycle_ledger:
+        from research_lifecycle import ResearchLifecycle
+
+        lifecycle = ResearchLifecycle(args.lifecycle_ledger, args.lifecycle_artifacts)
+        if args.results_file is None:
+            raise ValueError("lifecycle verification requires --results-file with the exported snapshot")
+        lifecycle.require_fresh_export(args.results_file)
+        original_strategy_dir = STRATEGIES_DIR
+        _LIFECYCLE_TEMP_DIR = tempfile.TemporaryDirectory(prefix="lifecycle-verification-")
+        STRATEGIES_DIR = materialize_lifecycle_strategies(
+            lifecycle, Path(_LIFECYCLE_TEMP_DIR.name), existing_strategy_dir=original_strategy_dir
+        )
 
     strategy_paths = strategy_files(args.strategies)
     load_claims()

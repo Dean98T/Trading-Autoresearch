@@ -67,6 +67,11 @@ restart_agent() {
 echo "[$(date '+%F %T')] Watchdog started (interval=${INTERVAL}s, stuck_after=${STUCK_AFTER}s)"
 
 while true; do
+    if [ -f logs/research_maintenance.flag ]; then
+        echo "[$(date '+%F %T')] Coordinated maintenance active — suppressing research-loop starts/restarts"
+        sleep $INTERVAL
+        continue
+    fi
     mapfile -t PIDS < <(get_pids)
 
     if [ "${#PIDS[@]}" -gt 1 ]; then
