@@ -32,6 +32,7 @@ _page_cache: dict = {"html": "<html><body>Loading dashboard…</body></html>", "
 
 # --- Timeframe cache: persists across renders ---
 _tf_cache: dict = {}
+_lifecycle_store = None
 
 
 def load_results() -> pd.DataFrame:
@@ -110,6 +111,72 @@ def build_validation_html(result: ValidationResult) -> str:
 
 def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def build_lifecycle_data(lifecycle=None) -> dict:
+    """Return attempt-qualified results and source references for lifecycle views."""
+    lifecycle = lifecycle or _lifecycle_store
+    if lifecycle is None:
+        return {"enabled": False, "attempts": [], "results": []}
+    lifecycle.require_fresh_view()
+    attempts = lifecycle.list_attempts()
+    results = lifecycle.current_results()
+    by_attempt = {item["attempt_id"]: item for item in attempts}
+    for attempt in attempts:
+        attempt["results"] = [row for row in results if row["attempt_id"] == attempt["attempt_id"]]
+        attempt["requested_provider"] = attempt["metadata"].get("requested_provider", "unknown")
+        attempt["requested_model"] = attempt["metadata"].get("requested_model", "unknown")
+        attempt["provenance_status"] = (
+            "incomplete" if any(value == "unknown" for value in (attempt["requested_provider"], attempt["requested_model"]))
+            else "recorded"
+        )
+    return {
+        "enabled": True,
+        "attempts": attempts,
+        "results": results,
+        "legacy_test_label": "exposed validation",
+        "freshness": "current",
+    }
+
+
+def build_lifecycle_panel(lifecycle=None) -> str:
+    data = build_lifecycle_data(lifecycle)
+    if not data["enabled"]:
+        return ""
+    rows = []
+    for attempt in data["attempts"]:
+        measured = sum(row["technical_outcome"] == "completed" for row in attempt["results"])
+        total = len(attempt["results"])
+        attempt_id = _esc(attempt["attempt_id"])
+        key = _esc(attempt["attempt_key"])
+        source_link = f"/api/lifecycle/source?attempt_id={attempt_id}"
+        rows.append(
+            f'<tr><td>{key}</td><td>{_esc(attempt["origin"])}</td>'
+            f'<td>{measured}/{total}</td><td>{_esc(attempt["provenance_status"])}</td>'
+            f'<td><a href="{source_link}">Archived source</a></td></tr>'
+        )
+    body = "".join(rows) or '<tr><td colspan="5" class="no-data">No lifecycle attempts recorded.</td></tr>'
+    return (
+        '<section class="main-pane active" style="display:block;padding:16px 20px">'
+        '<h2>Durable attempts</h2>'
+        '<p class="no-data">Test results are exposed validation. Each row keeps its attempt identity and archived source.</p>'
+        '<table><thead><tr><th>Attempt</th><th>Origin</th><th>Completed coverage</th><th>Provenance</th><th>Source</th></tr></thead>'
+        f'<tbody>{body}</tbody></table></section>'
+    )
+
+
+def get_lifecycle_source(attempt_id: str, lifecycle=None) -> tuple[str, str] | None:
+    lifecycle = lifecycle or _lifecycle_store
+    if lifecycle is None:
+        return None
+    attempt = lifecycle.get_attempt(attempt_id)
+    if attempt is None:
+        return None
+    try:
+        source = lifecycle.read_artifact(attempt_id, "candidate_source").decode("utf-8")
+    except KeyError:
+        return None
+    return attempt["attempt_key"], source
 
 
 def build_strategy_data(df: pd.DataFrame) -> str:
@@ -282,6 +349,7 @@ def render_html() -> str:
     scatter_data_json = json.dumps(scatter_data)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lifecycle_panel = build_lifecycle_panel()
 
     # Pre-compute test section (avoid nested f""" triple-quote issue in Python 3.11)
     if test_total > 0:
@@ -310,7 +378,7 @@ def render_html() -> str:
             '</table>'
         )
     else:
-        test_section = '<p class="no-data">No test results yet — kept strategies are automatically evaluated on 2025+ data.</p>'
+        test_section = '<p class="no-data">No exposed-validation results yet — kept strategies are automatically evaluated on historical 2025+ data.</p>'
 
     return f"""<!DOCTYPE html>
 <html data-theme="dark" lang="en">
@@ -541,6 +609,8 @@ def render_html() -> str:
 </head>
 <body>
 
+{lifecycle_panel}
+
 <header class="app-header">
   <div class="app-brand">⚡ LLM Trading Research</div>
   <div class="header-actions">
@@ -563,7 +633,7 @@ def render_html() -> str:
 <nav class="main-nav">
   <button class="nav-tab active" id="navbtn-overview" onclick="switchMainTab('overview')">📊 Overview</button>
   <button class="nav-tab" id="navbtn-train" onclick="switchMainTab('train')">🔵 Train Results</button>
-  <button class="nav-tab" id="navbtn-test" onclick="switchMainTab('test')">🧪 Test Results</button>
+  <button class="nav-tab" id="navbtn-test" onclick="switchMainTab('test')">🧪 Exposed Validation</button>
   <button class="nav-tab" id="navbtn-concepts" onclick="switchMainTab('concepts')">💡 Concepts</button>
   <button class="nav-tab" id="navbtn-log" onclick="switchMainTab('log')">📝 Research Log</button>
   <div class="nav-global-filters">
@@ -663,9 +733,9 @@ def render_html() -> str:
   </table>
 </div>
 
-<!-- Test Results pane -->
+<!-- Exposed Validation pane (historical test period) -->
 <div id="pane-test" class="main-pane">
-  <h2>Test Results (2025+) <span style="font-size:0.7em;color:var(--muted)">(click row for details)</span></h2>
+  <h2>Exposed Validation (historical test period, 2025+) <span style="font-size:0.7em;color:var(--muted)">(click row for details)</span></h2>
   {test_section}
 </div>
 
@@ -709,7 +779,7 @@ def render_html() -> str:
       <h3 style="margin:0;color:var(--accent2)">Results for: <span id="concept-sel-name" style="color:var(--accent)"></span></h3>
       <div style="display:flex;gap:8px">
         <button class="filter-btn" onclick="switchMainTab('train')" title="View full Train Results tab">Open Train Tab</button>
-        <button class="filter-btn" onclick="switchMainTab('test')" title="View full Test Results tab">Open Test Tab</button>
+        <button class="filter-btn" onclick="switchMainTab('test')" title="View exposed-validation results">Open Validation Tab</button>
         <button class="filter-btn" onclick="clearConceptPanel()" style="border-color:var(--red);color:var(--red)">Clear ✕</button>
       </div>
     </div>
@@ -722,7 +792,7 @@ def render_html() -> str:
         </table>
       </div>
       <div>
-        <h3 style="font-size:0.85em;margin:0 0 6px;color:var(--green)">🧪 Test Results (top matches)</h3>
+        <h3 style="font-size:0.85em;margin:0 0 6px;color:var(--green)">🧪 Exposed Validation (top matches)</h3>
         <table>
           <thead><tr><th>Strategy</th><th>Symbol</th><th>TF</th><th>Sharpe</th><th>Return</th><th>Max DD</th><th>Status</th></tr></thead>
           <tbody id="concept-test-rows"></tbody>
@@ -1071,7 +1141,7 @@ function _renderModal(strategyName, s) {{
     </div>`;
   }}
   for (const [period, rows] of Object.entries(s.rows_by_period)) {{
-    metricsHtml += `<h3>${{period === 'train' ? '📊 Train (2021–2024)' : '🧪 Test (2025+)'}}</h3>`;
+    metricsHtml += `<h3>${{period === 'train' ? '📊 Train (2021–2024)' : '🧪 Exposed Validation (historical 2025+)'}}</h3>`;
     metricsHtml += '<table class="metrics-table"><thead><tr><th>Symbol</th><th>Sharpe</th><th>Sortino</th><th>Calmar</th><th>Return</th><th>CAGR</th><th>Max DD</th><th>Win Rate</th><th>PF</th><th>Trades</th><th>Status</th><th></th></tr></thead><tbody>';
     for (const r of rows) {{
       const color = r.sharpe > 0 ? '#2ecc71' : '#e74c3c';
@@ -1961,7 +2031,7 @@ def get_strategy_data(strategy_name: str) -> dict:
         group = pd.read_sql_query(
             'SELECT git_commit AS "commit", strategy, symbol, sharpe, return_pct, cagr_pct, '
             'max_dd_pct, win_rate, profit_factor, trades, sortino, calmar, '
-            'status, description, period FROM results WHERE strategy=?',
+            "status, description, period FROM results WHERE strategy=? AND period IN ('train', 'test')",
             conn, params=(strategy_name,)
         )
     code = get_strategy_code(strategy_name)
@@ -2031,7 +2101,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
 
         parsed = urlparse(self.path)
-        if parsed.path == "/api/detail":
+        if parsed.path == "/api/lifecycle/results":
+            try:
+                result = build_lifecycle_data()
+                data = json.dumps(result, ensure_ascii=False)
+                status = 200
+            except Exception as exc:
+                data = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                status = 503
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data.encode("utf-8"))
+
+        elif parsed.path == "/api/lifecycle/source":
+            params = parse_qs(parsed.query)
+            attempt_id = params.get("attempt_id", [""])[0]
+            source = get_lifecycle_source(attempt_id)
+            if source is None:
+                self.send_error(404, "archived source not found")
+                return
+            attempt_key, code = source
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", f'inline; filename="{attempt_key}.py"')
+            self.end_headers()
+            self.wfile.write(code.encode("utf-8"))
+
+        elif parsed.path == "/api/detail":
             params = parse_qs(parsed.query)
             strategy = params.get("strategy", [""])[0]
             symbol = params.get("symbol", ["BTCUSDT"])[0]
@@ -2071,12 +2168,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _lifecycle_store
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--cache-interval", type=int, default=30,
                         help="Seconds between background cache refreshes (default: 30)")
+    parser.add_argument("--lifecycle-ledger", type=Path, default=None, help="Include durable attempt results from a lifecycle ledger")
+    parser.add_argument("--lifecycle-artifacts", type=Path, default=None, help="Artifact archive paired with --lifecycle-ledger")
     args = parser.parse_args()
+    if bool(args.lifecycle_ledger) != bool(args.lifecycle_artifacts):
+        parser.error("--lifecycle-ledger and --lifecycle-artifacts must be provided together")
+    if args.lifecycle_ledger:
+        from research_lifecycle import ResearchLifecycle
+        _lifecycle_store = ResearchLifecycle(args.lifecycle_ledger, args.lifecycle_artifacts)
 
     # Warm up cache before accepting requests
     print("Building initial cache…")

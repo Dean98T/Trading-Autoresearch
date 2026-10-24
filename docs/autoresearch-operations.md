@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document describes the operational guardrails added on 2026-04-03 and extended on 2026-04-07 so the research loop can detect invalid strategies, remove bad stored results, restart safely after fixes, pull fresh public ideas from the internet, and continue from the correct experiment number.
+This document describes the autoresearch guardrails and the gated durable-evidence pilot. The lifecycle ledger is opt-in while Priority 0 is being rehearsed; the existing legacy path remains available until a separate production cutover is approved.
 
 ## Current Runtime Flow
 
@@ -10,8 +10,10 @@ This document describes the operational guardrails added on 2026-04-03 and exten
 
 - `watchdog.sh` keeps `agent_research.py` alive.
 - `agent_research.py` generates strategies, runs validation and backtests, writes results, and saves passing strategies.
-- `results.db` is the primary experiment store.
-- `results.tsv` remains a compatibility mirror for older tooling.
+- In legacy mode, `results.db` is the primary experiment store and `results.tsv` is a compatibility mirror.
+- In lifecycle mode, the append-only lifecycle ledger and content-addressed artifact archive are the durable record. `current_results` and the exported TSV are rebuildable views.
+- `test` is historical exposed validation. It is available to research selection and does not represent an untouched final holdout.
+- Final-holdout evidence remains reserved. Ordinary attempts and evaluations cannot name it, and reserved legacy rows are retained only in the baseline archive.
 
 ### Scheduled concept research
 
@@ -59,7 +61,7 @@ If the process dies during an experiment, the same experiment slot is retried on
 
 ## Verification And Remediation Flow
 
-`verification_remediation.py` is the repo-level repair pass. It:
+`verification_remediation.py` is the repo-level repair pass. In legacy mode it:
 
 1. selects recent or explicitly named strategies
 2. runs `independent-verification/run_verification.py`
@@ -71,6 +73,14 @@ If the process dies during an experiment, the same experiment slot is retried on
 8. requests an autoresearch restart if invalid results were detected
 
 This is the mechanism that makes the system operationally self-correcting after new issues are found.
+
+With `--lifecycle-ledger`, remediation requires a fresh `--lifecycle-tsv`, resolves each claim to an exact archived attempt, records invalidation events, and appends a revalidation evaluation. It does not delete attempt history or source artifacts. Keep the lifecycle arguments paired; do not run lifecycle verification against a stale TSV.
+
+## Durable Evidence Pilot
+
+Manual attempts can be recorded with `run_research.py --lifecycle-ledger PATH --lifecycle-artifacts PATH`. Autonomous and systematic entrypoints expose the same paired options. Use the lifecycle ledger as the source for dashboard views and verification only when those arguments are supplied. This pilot does not turn on the final holdout or perform a production cutover.
+
+The operating sequence, including maintenance, baseline restore checks, rehearsal, and explicit blockers, is in [the Priority 0 cutover runbook](priority-zero-cutover-runbook.md).
 
 ## Look-Ahead Guardrails
 
@@ -124,5 +134,5 @@ The corrected check now catches those cases.
 ## Operator Notes
 
 - After patching core research logic, do not rely on an already-running `agent_research.py` process. Restart it through the watchdog path so the new logic becomes live.
-- If remediation deletes invalid stored results, allow the rerun flow to repopulate them before trusting dashboard summaries.
-- Treat `results.db` as the source of truth for current strategy status.
+- In legacy mode, allow the rerun flow to repopulate results after a purge before trusting dashboard summaries. In lifecycle mode, check the invalidation and revalidation records, rebuild the current view, and export a fresh TSV.
+- Treat the store selected for the running mode as authoritative: `results.db` for legacy mode, or the lifecycle ledger plus its archived artifacts for the pilot.

@@ -11,17 +11,79 @@ Usage:
 """
 
 import argparse
+import hashlib
+import tempfile
 from pathlib import Path
 
 from backtest import run_strategy_backtest
 from evaluate import compute_metrics
 from research_rules import test_symbol_pass, train_symbol_pass
+from research_lifecycle import ResearchLifecycle
+from research_maintenance import assert_research_enabled, lifecycle_writer
 from results_db import upsert_results, delete_strategy, metrics_to_db_dict
 from validator import run_prefix_lookahead_check, validate_file
 
 STRATEGIES_DIR = Path("strategies")
 DOCS_DIR = Path("docs/strategies")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
+def find_attempts_for_saved_source(
+    lifecycle: ResearchLifecycle, strategy_name: str, strategy_path: Path
+) -> list[str]:
+    """Resolve a saved file only to attempts with the same name and exact bytes."""
+    if not strategy_path.is_file():
+        return []
+    digest = hashlib.sha256(strategy_path.read_bytes()).hexdigest()
+    return sorted(
+        attempt["attempt_id"]
+        for attempt in lifecycle.list_attempts()
+        if attempt["display_strategy_name"] == strategy_name and attempt["source_hash"] == digest
+    )
+
+
+@lifecycle_writer("revalidation")
+def revalidate_attempt_with_lifecycle(
+    *,
+    lifecycle: ResearchLifecycle,
+    attempt_id: str,
+    symbols: list[str],
+    config: dict,
+    evaluator=None,
+    prefix_checker=None,
+) -> dict:
+    """Re-evaluate the archived candidate and append linked evidence."""
+    attempt = lifecycle.get_attempt(attempt_id)
+    if attempt is None:
+        raise KeyError(f"unknown experiment attempt: {attempt_id}")
+    source = lifecycle.read_artifact(attempt_id, "candidate_source")
+    code = source.decode("utf-8")
+    from validator import run_prefix_lookahead_check, validate_strategy
+
+    validation = validate_strategy(code)
+    if not validation.valid:
+        reason = "static validation failed: " + "; ".join(validation.errors)
+        return {"status": "invalidated", "invalidation": lifecycle.invalidate(attempt_id=attempt_id, reason=reason)}
+
+    with tempfile.TemporaryDirectory(prefix="revalidate-attempt-") as scratch:
+        candidate_path = Path(scratch) / f"{attempt['display_strategy_name']}.py"
+        candidate_path.write_bytes(source)
+        check = prefix_checker or (lambda path: run_prefix_lookahead_check(path))
+        prefix_ok, prefix_message = check(str(candidate_path))
+        if not prefix_ok:
+            reason = f"prefix look-ahead audit failed: {prefix_message}"
+            return {"status": "invalidated", "invalidation": lifecycle.invalidate(attempt_id=attempt_id, reason=reason)}
+        from run_research import evaluate_lifecycle_attempt
+
+        evaluation = evaluate_lifecycle_attempt(
+            attempt_id=attempt_id,
+            strategy_path=str(candidate_path),
+            symbols=symbols,
+            config=config,
+            lifecycle=lifecycle,
+            evaluator=evaluator,
+        )
+    return {"status": evaluation["status"], **evaluation}
 
 
 def get_git_commit() -> str:
@@ -81,9 +143,52 @@ def purge_invalid_strategy(strategy_name: str) -> None:
 
 
 def main():
+    assert_research_enabled()
     parser = argparse.ArgumentParser(description="Revalidate all saved strategies")
     parser.add_argument("--strategy", type=str, default=None, help="Single strategy to revalidate")
+    parser.add_argument("--attempt-id", type=str, default=None, help="Revalidate one durable experiment attempt")
+    parser.add_argument("--lifecycle-ledger", type=Path, default=None, help="Use append-only lifecycle evidence")
+    parser.add_argument("--lifecycle-artifacts", type=Path, default=None, help="Artifact archive required with --lifecycle-ledger")
     args = parser.parse_args()
+
+    if bool(args.lifecycle_ledger) != bool(args.lifecycle_artifacts):
+        parser.error("--lifecycle-ledger and --lifecycle-artifacts must be provided together")
+    if args.strategy and args.attempt_id:
+        parser.error("choose either --strategy or --attempt-id")
+
+    lifecycle = (
+        ResearchLifecycle(args.lifecycle_ledger, args.lifecycle_artifacts)
+        if args.lifecycle_ledger
+        else None
+    )
+    if lifecycle:
+        from prepare import load_config
+
+        if args.attempt_id:
+            attempt_ids = [args.attempt_id]
+        elif args.strategy:
+            path = STRATEGIES_DIR / f"{args.strategy}.py"
+            attempt_ids = find_attempts_for_saved_source(lifecycle, args.strategy, path)
+            if len(attempt_ids) != 1:
+                print(f"Cannot resolve {args.strategy!r} to one exact attempt; matches={len(attempt_ids)}. Use --attempt-id.")
+                return 2
+        else:
+            attempt_ids = []
+            for path in sorted(STRATEGIES_DIR.glob("*.py")):
+                matches = find_attempts_for_saved_source(lifecycle, path.stem, path)
+                if len(matches) == 1:
+                    attempt_ids.extend(matches)
+                elif len(matches) > 1:
+                    print(f"Ambiguous exact-source attempts for {path.stem}; use --attempt-id")
+        for attempt_id in attempt_ids:
+            result = revalidate_attempt_with_lifecycle(
+                lifecycle=lifecycle,
+                attempt_id=attempt_id,
+                symbols=SYMBOLS,
+                config=load_config(),
+            )
+            print(f"{attempt_id}: {result['status']}")
+        return 0
 
     commit = get_git_commit()
 
